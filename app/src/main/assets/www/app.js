@@ -950,7 +950,16 @@ function normalizeLyricLines(lines) {
         const start = +l.start;
         let end = l.end != null ? +l.end : NaN;
         if (isNaN(end) || end <= start) end = start + 4;
-        return { start, end, text: String(l.text || '').trim() };
+        // 워드싱크: w = [[start,end,text],...] 또는 [{s,e,t}] (초 단위)
+        let w = null;
+        if (Array.isArray(l.w) && l.w.length) {
+            w = l.w.map(a => Array.isArray(a) ? { s: +a[0], e: +a[1], t: String(a[2] ?? '') }
+                : { s: +a.s, e: +a.e, t: String(a.t ?? '') }).filter(x => x.t && isFinite(x.s));
+            if (!w.length) w = null;
+        }
+        const o = { start, end, text: w ? w.map(x => x.t).join('').trim() : String(l.text || '').trim() };
+        if (w) o.w = w;
+        return o;
     }).filter(l => l.text && !isNaN(l.start));
     for (let i = 0; i < out.length - 1; i++) {
         if (out[i].end > out[i + 1].start) out[i].end = out[i + 1].start;
@@ -3526,10 +3535,11 @@ function _renderLyrics() {
     if (!inner || !artArea) return;
     document.getElementById('np-no-lyrics')?.remove();
     inner.innerHTML = '';
+    LW.reset(); LY._hl = null;
     LY.lines.forEach((line, i) => {
         const el = document.createElement('div');
         el.className = 'np-lyric-line';
-        el.textContent = line.text;
+        LW.fill(el, line);
         el.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(el);
         LY.lines[i].el = el;
@@ -3656,6 +3666,7 @@ function _renderLvLyrics() {
     const inner = document.getElementById('np-lv-inner');
     if (!inner) return;
     inner.innerHTML = '';
+    if (LY._hl) LY._hl.lv = undefined;
 
     if (!LY.lines.length) {
         const empty = document.createElement('div');
@@ -3670,7 +3681,7 @@ function _renderLvLyrics() {
         wrap.className = 'np-lv-line-wrap';
         const main = document.createElement('div');
         main.className = 'np-lyric-line np-lv-line';
-        main.textContent = line.text;
+        LW.fill(main, line);
         wrap.appendChild(main);
         wrap.addEventListener('click', e => seekToLyric(line.start + 0.05, e));
         inner.appendChild(wrap);
@@ -3693,23 +3704,35 @@ function _renderLvLyrics() {
     );
 }
 
+/* 상태 클래스(active/prev/near)는 이전·현재 위치 주변 줄만 갱신 (줄 수 전체 순회/불필요한 class 변경 제거) */
+function _hlApply(tag, idx, getEls) {
+    const L = LY.lines, n = L.length, st = LY._hl || (LY._hl = {});
+    const prev = st[tag]; st[tag] = idx;
+    const set = (i) => {
+        const els = getEls(L[i]); if (!els) return;
+        const d = i - idx;
+        const cls = idx < 0 ? null : d === 0 ? 'active' : d === -1 ? 'prev' : (d >= 1 && d <= 3) ? 'near' : null;
+        for (const el of els) {
+            if (!el) continue;
+            const cl = el.classList;
+            const has = cl.contains('active') ? 'active' : cl.contains('prev') ? 'prev' : cl.contains('near') ? 'near' : null;
+            if (has === cls) continue;
+            if (has) cl.remove(has);
+            if (cls) cl.add(cls);
+        }
+    };
+    if (prev === undefined || prev === null) { for (let i = 0; i < n; i++) set(i); return; }
+    const a = Math.max(0, prev - 1), b = Math.min(n - 1, prev + 3);
+    for (let i = a; i <= b; i++) set(i);
+    if (idx >= 0) {
+        const c = Math.max(0, idx - 1), e = Math.min(n - 1, idx + 3);
+        for (let i = c; i <= e; i++) if (i < a || i > b) set(i);
+    }
+}
+
 function _highlightLvLine(idx, instant) {
     if (!LY.lines.length) return;
-    LY.lines.forEach((line, i) => {
-        if (!line.el_lv_wrap) return;
-        line.el_lv_wrap.classList.remove('active', 'prev', 'near');
-        line.el_lv?.classList.remove('active', 'prev', 'near');
-        if (idx < 0) return;
-        const d = i - idx;
-        let cls = null;
-        if (d === 0) cls = 'active';
-        else if (d === -1) cls = 'prev';
-        else if (d >= 1 && d <= 3) cls = 'near';
-        if (cls) {
-            line.el_lv_wrap.classList.add(cls);
-            line.el_lv?.classList.add(cls);
-        }
-    });
+    _hlApply('lv', idx, l => l.el_lv_wrap ? [l.el_lv_wrap, l.el_lv] : null);
 
     if (idx >= 0 && LY.lines[idx]?.el_lv_wrap) {
         const wrap = LY.lines[idx].el_lv_wrap;
@@ -3947,7 +3970,7 @@ function _buildFsLyricsDOM() {
     LY.lines.forEach((line, i) => {
         const el = document.createElement('div');
         el.className      = 'np-fs-lyric-line';
-        el.textContent    = line.text;
+        LW.fill(el, line);
         el.style.top       = (i * FS_ROW_H) + 'px';
         el.style.transition = 'none';
         el.style.opacity   = '0';
@@ -4069,7 +4092,8 @@ function _clampLyricEnds() {
 
 function _syncLyrics() {
     if (!LY.lines.length) return;
-    const cur = getPlayheadTime();
+    const cur = LW.now();   // 90ms 보간 시간(플레이어 브릿지 호출을 25Hz → ~11Hz 로 축소)
+    LW.ensure();
     const isFullscreen = document.getElementById('np')?.classList.contains('fullscreen');
     if (isFullscreen && LY.lines[0].start > 0.5 && cur < LY.lines[0].start) {
         const ratio = cur / LY.lines[0].start;
@@ -4139,20 +4163,14 @@ function _hideFsDots() {
 }
 
 function _highlightLine(idx, instant) {
+    LW.onLine(idx);   // 워드싱크 글자 DOM 구성/구동 (워드 데이터 없는 줄은 no-op)
     if (LV.active) _highlightLvLine(idx, instant);
     if (document.getElementById('np')?.classList.contains('fullscreen')) {
+        if (LY._hl) LY._hl.main = undefined;   // 전체화면 중엔 일반 줄 클래스를 갱신하지 않으므로 복귀 시 전체 재적용
         _highlightFsLine(idx);
         return;
     }
-    LY.lines.forEach((line, i) => {
-        if (!line.el) return;
-        line.el.classList.remove('active', 'prev', 'near');
-        if (idx < 0) return;
-        const d = i - idx;
-        if (d === 0) line.el.classList.add('active');
-        else if (d === -1) line.el.classList.add('prev');
-        else if (d >= 1 && d <= 3) line.el.classList.add('near');
-    });
+    _hlApply('main', idx, l => l.el ? [l.el] : null);
     if (idx >= 0 && LY.lines[idx]?.el) {
         const el = LY.lines[idx].el;
         const inner = document.getElementById('np-lyrics-inner');
