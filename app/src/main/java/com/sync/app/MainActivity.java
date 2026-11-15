@@ -37,6 +37,7 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -693,8 +694,16 @@ public class MainActivity extends AppCompatActivity {
         double dur      = msg.optDouble("duration", 0);
         String id       = msg.optString("id", "0");
 
+        // 워드싱크 우선: lrclib(lyricsfile YAML) 과 NetEase(yrc) 를 병렬 조회 →
+        // 워드싱크 > 줄 단위 순으로 채택 (lrclib 이 워드싱크를 주면 NetEase 결과는 버림)
+        java.util.concurrent.CompletableFuture<JSONArray> neF =
+                java.util.concurrent.CompletableFuture.supplyAsync(() -> tryNetEase(rawTitle, channel, dur));
         JSONArray lines = tryLrclib(rawTitle, channel, dur);
-        if (lines == null) lines = tryNetEase(rawTitle, channel, dur);
+        if (!hasWords(lines)) {
+            JSONArray ne = null;
+            try { ne = neF.get(15, java.util.concurrent.TimeUnit.SECONDS); } catch (Exception ignored) {}
+            if (hasWords(ne) || lines == null) lines = ne;
+        }
 
         try {
             JSONObject result = new JSONObject();
@@ -741,6 +750,7 @@ public class MainActivity extends AppCompatActivity {
 
             // ── 후보 채점 (PC 버전 동일 가중치) ──
             String bestLrc   = null;
+            JSONObject bestItem = null;
             double bestScore = Double.NEGATIVE_INFINITY;
 
             for (int i = 0; i < results.length(); i++) {
@@ -749,7 +759,9 @@ public class MainActivity extends AppCompatActivity {
                 // syncedLyrics 우선, 없으면 plainLyrics도 시도
                 String lrcText = item.optString("syncedLyrics", "");
                 if (lrcText.isEmpty()) lrcText = item.optString("plainLyrics", "");
-                if (lrcText.isEmpty()) continue;
+                boolean ws = item.optBoolean("hasWordSync", false)
+                        || jstr(item, "lyricsfile").contains("words:");
+                if (lrcText.isEmpty() && !ws) continue;
 
                 double lrcDur = getLrcLastTimestamp(lrcText);
                 if (lrcDur <= 0) lrcDur = item.optDouble("duration", 0);
@@ -767,10 +779,18 @@ public class MainActivity extends AppCompatActivity {
                 score += titleSim(ca, item.optString("artistName", "")) * 20;
                 // syncedLyrics 있으면 보너스
                 if (!item.optString("syncedLyrics", "").isEmpty()) score += 10;
+                if (ws) score += 12;   // 워드싱크 가사 우선 (시간/제목 일치도가 크게 다르면 일치도가 이김)
 
-                if (score > bestScore) { bestScore = score; bestLrc = lrcText; }
+                if (score > bestScore) { bestScore = score; bestLrc = lrcText; bestItem = item; }
             }
-            return bestLrc != null ? parseLrc(bestLrc) : null;
+            if (bestItem != null) {
+                String yf = jstr(bestItem, "lyricsfile");
+                if (yf.isEmpty() && bestItem.optBoolean("hasWordSync", false) && bestItem.optLong("id", 0) > 0)
+                    yf = fetchLrclibLyricsfile(bestItem.optLong("id"));
+                JSONArray wl = yf.isEmpty() ? null : parseLyricsfileYaml(yf);
+                if (wl != null) return wl;
+            }
+            return (bestLrc != null && !bestLrc.isEmpty()) ? parseLrc(bestLrc) : null;
         } catch (Exception e) { return null; }
     }
 
@@ -890,7 +910,7 @@ public class MainActivity extends AppCompatActivity {
     private JSONArray fetchNetEaseLrc(long songId) {
         try {
             String url = "https://music.163.com/api/song/lyric?id="
-                    + songId + "&lv=1&kv=1&tv=-1";
+                    + songId + "&lv=1&kv=1&tv=-1&yv=1";
             Request req = new Request.Builder().url(url)
                     .addHeader("Referer", "https://music.163.com")
                     .addHeader("Cookie",  "appver=8.0.0")
@@ -898,13 +918,22 @@ public class MainActivity extends AppCompatActivity {
             try (Response resp = http.newCall(req).execute()) {
                 if (resp.body() == null) return null;
                 JSONObject doc = new JSONObject(readUtf8(resp));
-                String lrc = null;
-                if (doc.has("klyric"))
-                    lrc = doc.getJSONObject("klyric").optString("lyric", null);
-                if (lrc == null || lrc.isEmpty())
-                    if (doc.has("lrc"))
-                        lrc = doc.getJSONObject("lrc").optString("lyric", null);
-                return (lrc != null && !lrc.isEmpty()) ? parseLrc(lrc) : null;
+                // 1) 워드싱크(yrc)
+                if (doc.optJSONObject("yrc") != null) {
+                    JSONArray w = parseYrc(doc.getJSONObject("yrc").optString("lyric", ""));
+                    if (w != null && w.length() > 0) return w;
+                }
+                // 2) 줄 단위 (klyric 는 [ms,dur] 형식이라 parseLrc 로 읽히지 않으면 lrc 로 폴백)
+                JSONArray out = null;
+                if (doc.optJSONObject("klyric") != null) {
+                    String k = doc.getJSONObject("klyric").optString("lyric", "");
+                    if (!k.isEmpty()) out = parseLrc(k);
+                }
+                if ((out == null || out.length() == 0) && doc.optJSONObject("lrc") != null) {
+                    String l = doc.getJSONObject("lrc").optString("lyric", "");
+                    if (!l.isEmpty()) out = parseLrc(l);
+                }
+                return (out != null && out.length() > 0) ? out : null;
             }
         } catch (Exception e) { return null; }
     }
@@ -968,6 +997,199 @@ public class MainActivity extends AppCompatActivity {
             result.put(obj);
         }
         return result;
+    }
+
+
+    // ══════════════════════════════════════════════════
+    //  워드싱크 가사 (word-level)
+    //   출력 형식: {start,end,text,w:[[s,e,"word"],...]}  (초 단위, w 없으면 줄 단위)
+    // ══════════════════════════════════════════════════
+    private static String jstr(JSONObject o, String k) {
+        return (o == null || o.isNull(k)) ? "" : o.optString(k, "");
+    }
+
+    private static boolean hasWords(JSONArray a) {
+        if (a == null) return false;
+        for (int i = 0; i < a.length(); i++) {
+            JSONObject o = a.optJSONObject(i);
+            if (o != null && o.has("w")) return true;
+        }
+        return false;
+    }
+
+    private static double sec(long ms) { return Math.round((double) ms) / 1000.0; }
+
+    private String fetchLrclibLyricsfile(long id) {
+        try {
+            Request req = new Request.Builder().url("https://lrclib.net/api/get/" + id)
+                    .addHeader("User-Agent", "SYNCApp/1.0 (https://github.com/sync)")
+                    .addHeader("Accept", "application/json").build();
+            try (Response resp = http.newCall(req).execute()) {
+                if (resp.body() == null || !resp.isSuccessful()) return "";
+                return jstr(new JSONObject(readUtf8(resp)), "lyricsfile");
+            }
+        } catch (Exception e) { return ""; }
+    }
+
+    private static String yamlScalar(String v) {
+        if (v.isEmpty()) return "";
+        char c = v.charAt(0);
+        if (c == '\'') {
+            int e = v.lastIndexOf('\'');
+            if (e > 0) return v.substring(1, e).replace("''", "'");
+        }
+        if (c == '"') {
+            try {
+                Object o = new org.json.JSONTokener(v).nextValue();
+                if (o instanceof String) return (String) o;
+            } catch (Exception ignored) {}
+            int e = v.lastIndexOf('"');
+            if (e > 0) return v.substring(1, e);
+        }
+        int h = v.indexOf(" #");
+        return h >= 0 ? v.substring(0, h).trim() : v;
+    }
+
+    private static long yamlLong(String v) {
+        try { return Long.parseLong(yamlScalar(v).trim()); } catch (Exception e) { return -1; }
+    }
+
+    private static final class YW { String t; long s = -1, e = -1; }
+    private static final class YL { String t; long s = -1, e = -1; final List<YW> w = new ArrayList<>(); }
+
+    /** lrclib 'lyricsfile'(YAML) → 줄/단어 타임라인. 워드 타이밍이 하나도 없으면 null. */
+    private JSONArray parseLyricsfileYaml(String y) {
+        if (y == null || !y.contains("words")) return null;
+        try {
+            List<YL> lines = new ArrayList<>();
+            boolean inLines = false, inWords = false;
+            int itemIndent = -1, keyIndent = -1;
+            YL cl = null; YW cwd = null;
+            for (String raw : y.split("\n")) {
+                if (raw.endsWith("\r")) raw = raw.substring(0, raw.length() - 1);
+                String tr = raw.trim();
+                if (tr.isEmpty() || tr.startsWith("#")) continue;
+                int ind = 0;
+                while (ind < raw.length() && raw.charAt(ind) == ' ') ind++;
+                if (ind == 0 && !tr.startsWith("-")) {            // 최상위 키
+                    inLines = tr.startsWith("lines:"); inWords = false; cwd = null;
+                    continue;
+                }
+                if (!inLines) continue;
+                boolean isItem = tr.equals("-") || tr.startsWith("- ");
+                if (isItem && itemIndent < 0) { itemIndent = ind; keyIndent = ind + 2; }
+                if (isItem) {
+                    String rest = tr.length() > 2 ? tr.substring(2).trim() : "";
+                    if (ind == itemIndent) { cl = new YL(); lines.add(cl); inWords = false; cwd = null; }
+                    else { if (cl == null) continue; cwd = new YW(); cl.w.add(cwd); }
+                    if (rest.isEmpty()) continue;
+                    tr = rest; ind += 2;
+                }
+                int c = tr.indexOf(':');
+                if (c < 0 || cl == null) continue;
+                String key = tr.substring(0, c).trim(), val = tr.substring(c + 1).trim();
+                if (inWords && cwd != null && ind > keyIndent) {    // 단어 속성
+                    if (key.equals("text")) cwd.t = yamlScalar(val);
+                    else if (key.equals("start_ms")) cwd.s = yamlLong(val);
+                    else if (key.equals("end_ms")) cwd.e = yamlLong(val);
+                } else {                                            // 줄 속성
+                    if (key.equals("words")) { inWords = true; cwd = null; }
+                    else {
+                        inWords = false; cwd = null;
+                        if (key.equals("text")) cl.t = yamlScalar(val);
+                        else if (key.equals("start_ms")) cl.s = yamlLong(val);
+                        else if (key.equals("end_ms")) cl.e = yamlLong(val);
+                    }
+                }
+            }
+            List<JSONObject> out = new ArrayList<>();
+            boolean any = false;
+            for (YL l : lines) {
+                List<YW> ws = new ArrayList<>();
+                for (YW w : l.w) if (w.t != null && !w.t.isEmpty() && w.s >= 0) ws.add(w);
+                long s = l.s >= 0 ? l.s : (ws.isEmpty() ? -1 : ws.get(0).s);
+                if (s < 0) continue;
+                StringBuilder sb = new StringBuilder();
+                JSONArray wa = new JSONArray();
+                for (int i = 0; i < ws.size(); i++) {
+                    YW w = ws.get(i);
+                    long e = w.e >= 0 ? w.e : (i + 1 < ws.size() ? ws.get(i + 1).s : (l.e >= 0 ? l.e : w.s + 800));
+                    if (e < w.s) e = w.s;
+                    sb.append(w.t);
+                    wa.put(new JSONArray().put(sec(w.s)).put(sec(e)).put(w.t));
+                }
+                String text = ws.isEmpty() ? (l.t == null ? "" : l.t.trim()) : sb.toString().trim();
+                if (text.isEmpty() || CREDIT_RX.matcher(text).matches()) continue;
+                JSONObject o = new JSONObject();
+                o.put("start", sec(s));
+                if (l.e >= 0) o.put("end", sec(l.e));
+                o.put("text", text);
+                if (wa.length() > 0) { o.put("w", wa); any = true; }
+                out.add(o);
+            }
+            if (!any) return null;
+            Collections.sort(out, (a, b) -> Double.compare(a.optDouble("start"), b.optDouble("start")));
+            JSONArray res = new JSONArray();
+            for (int i = 0; i < out.size(); i++) {
+                JSONObject o = out.get(i);
+                double st = o.optDouble("start");
+                double nx = i + 1 < out.size() ? out.get(i + 1).optDouble("start") : st + 5.0;
+                double en = o.has("end") ? o.optDouble("end") : nx;
+                if (en > nx) en = nx;
+                if (en - st < 0.1) en = st + 0.5;
+                o.put("end", en);
+                res.put(o);
+            }
+            return res;
+        } catch (Exception e) { return null; }
+    }
+
+    // NetEase yrc: [lineStart,lineDur](wordStart,wordDur,0)word(...)...
+    private static final Pattern YRC_W = Pattern.compile("\\((\\d+),(\\d+),-?\\d+\\)");
+
+    private JSONArray parseYrc(String yrc) throws JSONException {
+        if (yrc == null || yrc.isEmpty()) return null;
+        List<JSONObject> out = new ArrayList<>();
+        for (String raw : yrc.split("\n")) {
+            String ln = raw.trim();
+            if (!ln.startsWith("[")) continue;
+            int rb = ln.indexOf(']');
+            if (rb < 0) continue;
+            String[] hd = ln.substring(1, rb).split(",");
+            if (hd.length < 2) continue;
+            long ls, ld;
+            try { ls = Long.parseLong(hd[0].trim()); ld = Long.parseLong(hd[1].trim()); }
+            catch (NumberFormatException e) { continue; }
+            String rest = ln.substring(rb + 1);
+            Matcher m = YRC_W.matcher(rest);
+            List<long[]> pos = new ArrayList<>();      // {wordStart, wordDur, textFrom, matchStart}
+            while (m.find())
+                pos.add(new long[]{Long.parseLong(m.group(1)), Long.parseLong(m.group(2)), m.end(), m.start()});
+            if (pos.isEmpty()) continue;
+            StringBuilder sb = new StringBuilder();
+            JSONArray wa = new JSONArray();
+            for (int i = 0; i < pos.size(); i++) {
+                long[] p = pos.get(i);
+                int to = i + 1 < pos.size() ? (int) pos.get(i + 1)[3] : rest.length();
+                String t = rest.substring((int) p[2], to);
+                if (t.isEmpty()) continue;
+                sb.append(t);
+                wa.put(new JSONArray().put(sec(p[0])).put(sec(p[0] + p[1])).put(t));
+            }
+            String text = sb.toString().trim();
+            if (text.isEmpty() || wa.length() == 0 || CREDIT_RX.matcher(text).matches()) continue;
+            JSONObject o = new JSONObject();
+            o.put("start", sec(ls));
+            o.put("end", sec(ls + Math.max(ld, 100)));
+            o.put("text", text);
+            o.put("w", wa);
+            out.add(o);
+        }
+        if (out.isEmpty()) return null;
+        Collections.sort(out, (a, b) -> Double.compare(a.optDouble("start"), b.optDouble("start")));
+        JSONArray res = new JSONArray();
+        for (JSONObject o : out) res.put(o);
+        return res;
     }
 
     // ══════════════════════════════════════════════════
